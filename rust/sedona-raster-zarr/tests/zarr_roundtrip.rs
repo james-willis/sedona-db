@@ -23,13 +23,18 @@ use std::sync::Arc;
 
 use sedona_raster::array::RasterStructArray;
 use sedona_raster::traits::RasterRef;
-use sedona_raster_zarr::{group_to_indb_rasters, group_to_outdb_rasters};
+use sedona_raster_zarr::{group_to_indb_rasters, group_to_outdb_rasters, ZarrCredentialOptions};
 use sedona_schema::raster::BandDataType;
 use tempfile::TempDir;
 use zarrs::array::data_type;
-use zarrs::array::ArrayBuilder;
-use zarrs::group::GroupBuilder;
+use zarrs::array::{Array, ArrayBuilder, ArrayBytes};
+use zarrs::group::{Group, GroupBuilder};
+use zarrs::storage::storage_adapter::async_to_sync::{
+    AsyncToSyncBlockOn, AsyncToSyncStorageAdapter,
+};
+use zarrs::storage::{ListableStorageTraits, ReadableListableStorageTraits, ReadableStorageTraits};
 use zarrs_filesystem::FilesystemStore;
+use zarrs_object_store::AsyncObjectStore;
 
 /// Build a 2-band group on disk:
 ///   - dims:  [t, y, x]
@@ -106,7 +111,7 @@ fn build_fixture() -> TempDir {
 fn indb_round_trip_emits_one_row_per_chunk_position() {
     let tmp = build_fixture();
     let uri = format!("file://{}", tmp.path().display());
-    let arr = group_to_indb_rasters(&uri).unwrap();
+    let arr = group_to_indb_rasters(&uri, &ZarrCredentialOptions::default()).unwrap();
 
     let rasters = RasterStructArray::new(&arr);
     assert_eq!(rasters.len(), 8, "expected 8 chunk rows (2*2*2)");
@@ -155,7 +160,7 @@ fn indb_round_trip_emits_one_row_per_chunk_position() {
 fn outdb_emits_chunk_anchors() {
     let tmp = build_fixture();
     let uri = format!("file://{}", tmp.path().display());
-    let arr = group_to_outdb_rasters(&uri).unwrap();
+    let arr = group_to_outdb_rasters(&uri, &ZarrCredentialOptions::default()).unwrap();
 
     let rasters = RasterStructArray::new(&arr);
     assert_eq!(rasters.len(), 8);
@@ -187,6 +192,84 @@ fn outdb_emits_chunk_anchors() {
     assert!(anchor.contains("&chunk=1,1,1"), "got: {anchor}");
 }
 
+/// Bridge an `object_store::ObjectStore` to a sync zarrs storage handle
+/// the same way [`sedona_raster_zarr::source_uri::parse_zarr_uri`] does
+/// for cloud schemes. The test owns its tokio runtime so the bridge
+/// runs in isolation from the global one.
+struct TestBlockOn(tokio::runtime::Handle);
+
+impl AsyncToSyncBlockOn for TestBlockOn {
+    fn block_on<F: core::future::Future>(&self, future: F) -> F::Output {
+        self.0.block_on(future)
+    }
+}
+
+#[test]
+fn inmemory_object_store_roundtrip() {
+    // Build the canonical filesystem fixture, then copy every Zarr key
+    // into an `object_store::memory::InMemory` and read it back through
+    // the AsyncObjectStore → AsyncToSyncStorageAdapter bridge. This
+    // exercises the exact wiring used for cloud schemes (s3, gs, az,
+    // http) without touching a network — if any of zarrs's
+    // sync→async→sync key translations break, this test catches it.
+    let tmp = build_fixture();
+    let fs_store = Arc::new(FilesystemStore::new(tmp.path()).unwrap());
+    let in_memory: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+
+    // Build a dedicated multi-thread runtime so the bridge has a handle
+    // distinct from the test thread's blocking context.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    // Mirror every key from the FilesystemStore into the InMemory store
+    // via object_store::put, going through the same runtime handle the
+    // adapter will use for reads.
+    let keys = fs_store.list().unwrap();
+    for key in &keys {
+        let bytes = fs_store
+            .get(key)
+            .unwrap()
+            .expect("fixture key present in filesystem store");
+        let path = object_store::path::Path::from(key.as_str());
+        let im = in_memory.clone();
+        let payload = object_store::PutPayload::from_bytes(bytes);
+        runtime
+            .block_on(async move { im.put(&path, payload).await })
+            .unwrap();
+    }
+
+    let async_storage = Arc::new(AsyncObjectStore::new(in_memory));
+    let storage: Arc<dyn ReadableListableStorageTraits> = Arc::new(AsyncToSyncStorageAdapter::new(
+        async_storage,
+        TestBlockOn(runtime.handle().clone()),
+    ));
+
+    // Open the group through the bridged storage — the call path is
+    // identical to a real cloud read.
+    let group = Group::open(storage.clone(), "/").unwrap();
+    assert_eq!(group.attributes().get("proj:epsg").unwrap(), 4326);
+
+    let arrays = group.child_arrays().unwrap();
+    assert_eq!(arrays.len(), 2, "fixture has 2 arrays");
+
+    // Pick out `temperature` deterministically — child_arrays order is
+    // not guaranteed by zarrs, so look it up by path.
+    let temperature: &Array<dyn ReadableListableStorageTraits> = arrays
+        .iter()
+        .find(|a| a.path().as_str() == "/temperature")
+        .expect("temperature array present");
+
+    // Chunk (0, 0, 0) was filled with pixel values 0,1,4,5 by the
+    // fixture builder — see build_fixture above for the formula.
+    let bytes: ArrayBytes<'static> = temperature.retrieve_chunk(&[0, 0, 0]).unwrap();
+    let raw = bytes.into_fixed().unwrap();
+    assert_eq!(&*raw, &[0u8, 1, 4, 5]);
+}
+
 #[test]
 fn errors_on_empty_group() {
     let tmp = TempDir::new().unwrap();
@@ -197,7 +280,9 @@ fn errors_on_empty_group() {
         .store_metadata()
         .unwrap();
     let uri = format!("file://{}", tmp.path().display());
-    let err = group_to_indb_rasters(&uri).unwrap_err().to_string();
+    let err = group_to_indb_rasters(&uri, &ZarrCredentialOptions::default())
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("no child arrays"), "got: {err}");
 }
 
@@ -224,7 +309,9 @@ fn errors_on_mismatched_chunk_grids() {
         .unwrap();
 
     let uri = format!("file://{}", tmp.path().display());
-    let err = group_to_indb_rasters(&uri).unwrap_err().to_string();
+    let err = group_to_indb_rasters(&uri, &ZarrCredentialOptions::default())
+        .unwrap_err()
+        .to_string();
     assert!(
         err.contains("chunk") && err.contains("array_a") && err.contains("array_b"),
         "got: {err}"

@@ -38,7 +38,17 @@
 //!    the GDAL OutDb convention and lets the format-keyed dispatcher
 //!    route without parsing URI schemes.
 
+use std::sync::Arc;
+
 use arrow_schema::ArrowError;
+use zarrs::storage::storage_adapter::async_to_sync::AsyncToSyncStorageAdapter;
+use zarrs_filesystem::FilesystemStore;
+use zarrs_object_store::AsyncObjectStore;
+
+use crate::credentials::ZarrCredentialOptions;
+use crate::object_store_backends::{build_azure, build_gcs, build_http, build_s3};
+use crate::runtime::TokioBlockOn;
+use crate::storage::ZarrStorage;
 
 /// Parts of a chunk-anchor URI.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,25 +139,71 @@ pub fn parse_chunk_anchor(uri: &str) -> Result<ChunkAnchor, ArrowError> {
     })
 }
 
-/// Normalize a user-supplied group URI into a local filesystem path.
+/// Dispatch a user-supplied group URI to a backing storage handle.
 ///
-/// Phase 1 supports `file://` and bare-path URIs only. Cloud schemes
-/// (`s3://`, `gs://`, `az://`, `https://`) error with a clear message
-/// pointing at the resolver work that adds them.
-pub fn group_uri_to_filesystem_path(uri: &str) -> Result<std::path::PathBuf, ArrowError> {
-    if let Some(rest) = uri.strip_prefix("file://") {
-        return Ok(std::path::PathBuf::from(rest));
-    }
-    for scheme in ["s3://", "gs://", "az://", "https://", "http://"] {
-        if uri.starts_with(scheme) {
-            return Err(ArrowError::NotYetImplemented(format!(
-                "cloud Zarr stores ({scheme}…) are not supported in this phase; \
-                 use a local filesystem path or `file://` URI for now"
+/// Returns `(storage, group_path)` where `group_path` is the path of the
+/// group inside the store (always `"/"` for filesystem stores; the
+/// URL-path component for cloud stores). The caller passes both straight
+/// to `zarrs::Group::open(storage, &group_path)`.
+///
+/// Supported schemes:
+///
+/// | Scheme(s)                            | Backend                  |
+/// |--------------------------------------|--------------------------|
+/// | `file://`, bare path                 | `FilesystemStore`        |
+/// | `s3://`                              | `AmazonS3` via object_store |
+/// | `gs://`, `gcs://`                    | `GoogleCloudStorage` via object_store |
+/// | `az://`, `abfs://`, `abfss://`       | `MicrosoftAzure` via object_store |
+/// | `http://`, `https://`                | `HttpStore` via object_store |
+///
+/// Cloud backends go through the async→sync bridge in
+/// [`crate::runtime`], so callers don't need to spin up their own tokio
+/// runtime.
+pub fn parse_zarr_uri(
+    uri: &str,
+    creds: &ZarrCredentialOptions,
+) -> Result<(ZarrStorage, String), ArrowError> {
+    let scheme = uri.split_once("://").map(|(s, _)| s);
+
+    let (object_store, path) = match scheme {
+        Some("file") => {
+            let rest = uri.strip_prefix("file://").unwrap_or(uri);
+            return filesystem_storage(rest);
+        }
+        None => return filesystem_storage(uri),
+        Some("s3") => build_s3(uri, creds)?,
+        Some("gs") | Some("gcs") => build_gcs(uri, creds)?,
+        Some("az") | Some("abfs") | Some("abfss") => build_azure(uri, creds)?,
+        Some("http") | Some("https") => build_http(uri, creds)?,
+        Some(other) => {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "unsupported Zarr URI scheme {other:?} in {uri}; \
+                 expected one of file/s3/gs/gcs/az/abfs/abfss/http/https or a bare path"
             )));
         }
-    }
-    // Bare path.
-    Ok(std::path::PathBuf::from(uri))
+    };
+
+    let async_store = Arc::new(AsyncObjectStore::new(object_store));
+    let storage: ZarrStorage = Arc::new(AsyncToSyncStorageAdapter::new(
+        async_store,
+        TokioBlockOn::new(),
+    ));
+    let group_path = if path.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", path.trim_start_matches('/'))
+    };
+    Ok((storage, group_path))
+}
+
+fn filesystem_storage(path: &str) -> Result<(ZarrStorage, String), ArrowError> {
+    let store = FilesystemStore::new(std::path::PathBuf::from(path)).map_err(|e| {
+        ArrowError::ExternalError(Box::new(std::io::Error::other(format!(
+            "failed to open Zarr filesystem store at {path}: {e}"
+        ))))
+    })?;
+    let storage: ZarrStorage = Arc::new(store);
+    Ok((storage, "/".to_string()))
 }
 
 #[cfg(test)]
@@ -264,23 +320,33 @@ mod tests {
     }
 
     #[test]
-    fn group_uri_file_scheme() {
-        let path = group_uri_to_filesystem_path("file:///tmp/foo.zarr").unwrap();
-        assert_eq!(path, std::path::PathBuf::from("/tmp/foo.zarr"));
+    fn parse_zarr_uri_file_scheme() {
+        let creds = ZarrCredentialOptions::default();
+        // FilesystemStore::new succeeds even on a non-existent path —
+        // errors are surfaced at first read. We just need the dispatch
+        // to land on the filesystem branch and report `/` as the group
+        // path.
+        let (_storage, group_path) = parse_zarr_uri("file:///tmp/foo.zarr", &creds).unwrap();
+        assert_eq!(group_path, "/");
     }
 
     #[test]
-    fn group_uri_bare_path() {
-        let path = group_uri_to_filesystem_path("/tmp/foo.zarr").unwrap();
-        assert_eq!(path, std::path::PathBuf::from("/tmp/foo.zarr"));
+    fn parse_zarr_uri_bare_path() {
+        let creds = ZarrCredentialOptions::default();
+        let (_storage, group_path) = parse_zarr_uri("/tmp/foo.zarr", &creds).unwrap();
+        assert_eq!(group_path, "/");
     }
 
     #[test]
-    fn group_uri_cloud_scheme_errors() {
-        let err = group_uri_to_filesystem_path("s3://bucket/foo.zarr")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("s3://"), "{err}");
-        assert!(err.contains("not supported"), "{err}");
+    fn parse_zarr_uri_rejects_unknown_scheme() {
+        let creds = ZarrCredentialOptions::default();
+        // `Arc<dyn ReadableListableStorageTraits>` is not `Debug`, so we
+        // can't use `unwrap_err` here — match on the Result directly.
+        let err = match parse_zarr_uri("ftp://example.com/foo.zarr", &creds) {
+            Ok(_) => panic!("expected error for unknown scheme"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("ftp"), "{err}");
+        assert!(err.contains("unsupported"), "{err}");
     }
 }

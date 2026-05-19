@@ -33,9 +33,14 @@
 //! Phase 1 supports local filesystem stores only; cloud backends arrive
 //! with the resolver work.
 
+pub mod credentials;
 pub mod dtype;
 pub mod geozarr;
 pub mod loader;
+mod object_store_backends;
+mod runtime;
 pub mod source_uri;
+mod storage;
 
+pub use credentials::ZarrCredentialOptions;
 pub use loader::{group_to_indb_rasters, group_to_outdb_rasters};

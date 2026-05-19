@@ -34,12 +34,17 @@ result_large_err = "allow"
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 datafusion-common = { workspace = true }
+object_store = { workspace = true, features = ["aws", "gcp", "azure", "http"] }
 sedona-common = { workspace = true }
 sedona-raster = { workspace = true }
 sedona-schema = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
-zarrs = { workspace = true, features = ["filesystem", "gzip", "zstd", "crc32c", "sharding", "transpose"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
+url = { workspace = true }
+zarrs = { workspace = true, features = ["filesystem", "gzip", "zstd", "crc32c", "sharding", "transpose", "async"] }
 zarrs_filesystem = { workspace = true }
+zarrs_object_store = { workspace = true }
 
 # `blosc` is gated off Windows: c-blosc (statically linked) bundles its own
 # `pthread_create` / `pthread_cond_*` symbols, which conflict with rtools45's
@@ -50,3 +55,4 @@ zarrs = { workspace = true, features = ["blosc"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

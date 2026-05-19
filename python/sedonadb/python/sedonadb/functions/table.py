@@ -120,6 +120,7 @@ class TableFunctions:
         mode: Optional[Literal["indb", "outdb"]] = None,
         rows_per_batch: Optional[int] = None,
         num_partitions: Optional[int] = None,
+        credentials: Optional[dict] = None,
     ) -> DataFrame:
         """
         Read a Zarr group as a DataFrame of N-D rasters.
@@ -129,14 +130,17 @@ class TableFunctions:
         the corresponding chunks of each array in the group. All ``RS_*``
         UDFs operate on the column unchanged.
 
-        Phase 1 supports local filesystem stores only (``file://`` URIs or
-        bare paths); cloud schemes (``s3://`` / ``gs://`` / ``az://`` /
-        ``https://``) error pending the OutDb resolver work.
+        Supported URI schemes: ``file://`` and bare paths (local), plus
+        ``s3://``, ``gs://``/``gcs://``, ``az://``/``abfs://``/``abfss://``,
+        and ``http://``/``https://``. Cloud backends pick up credentials
+        from standard environment variables by default; explicit overrides
+        can be passed via ``credentials``.
 
         Parameters
         ----------
         uri : str
-            Zarr group URI. ``file:///path/to/foo.zarr`` or a bare local path.
+            Zarr group URI. Local (``file:///...``, bare paths) or cloud
+            (``s3://``, ``gs://``, ``az://``, ``https://``).
         mode : {"indb", "outdb"}, optional
             ``"indb"`` (default) materializes every chunk's bytes into the
             Arrow ``data`` column eagerly. ``"outdb"`` emits chunk-anchor
@@ -146,11 +150,25 @@ class TableFunctions:
             Chunks per ``RecordBatch`` (default 1024).
         num_partitions : int, optional
             Scan partitions. Phase 1 supports only 1; > 1 errors.
+        credentials : dict, optional
+            Per-backend credential overrides, keyed by ``<scheme>.<field>``.
+            Recognised keys include ``aws.access_key_id``,
+            ``aws.secret_access_key``, ``aws.session_token``, ``aws.region``,
+            ``aws.endpoint``, ``aws.allow_http``, ``aws.skip_signature``;
+            ``gcp.service_account_path``, ``gcp.service_account_key``,
+            ``gcp.application_credentials_path``; ``azure.account_name``,
+            ``azure.account_key``, ``azure.client_id``, ``azure.client_secret``,
+            ``azure.tenant_id``, ``azure.use_emulator``. Unset values fall
+            through to env-var-based authentication.
 
         Examples
         --------
         >>> sd = sedona.db.connect()
         >>> sd.funcs.table.sd_read_zarr("file:///path/to/datacube.zarr")  # doctest: +SKIP
+        >>> sd.funcs.table.sd_read_zarr(
+        ...     "s3://bucket/datacube.zarr",
+        ...     credentials={"aws.region": "us-west-2"},
+        ... )  # doctest: +SKIP
         """
 
         args = {
@@ -159,6 +177,8 @@ class TableFunctions:
             "num_partitions": num_partitions,
         }
         args = {k: v for k, v in args.items() if v is not None}
+        if credentials:
+            args.update({str(k): str(v) for k, v in credentials.items()})
 
         if args:
             return self._ctx.sql(

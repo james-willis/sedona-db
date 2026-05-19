@@ -30,8 +30,6 @@
 //!   Byte resolution awaits the format-keyed dispatch work in a
 //!   follow-up PR.
 
-use std::sync::Arc;
-
 use arrow_array::StructArray;
 use arrow_schema::ArrowError;
 use sedona_common::sedona_internal_datafusion_err;
@@ -39,25 +37,36 @@ use sedona_raster::builder::RasterBuilder;
 use sedona_schema::raster::BandDataType;
 use zarrs::array::{Array, ArrayBytes};
 use zarrs::group::Group;
-use zarrs_filesystem::FilesystemStore;
+use zarrs::storage::ReadableListableStorageTraits;
 
+use crate::credentials::ZarrCredentialOptions;
 use crate::dtype::zarr_to_band_data_type;
 use crate::geozarr::GroupGeoMetadata;
-use crate::source_uri::{build_chunk_anchor, group_uri_to_filesystem_path};
+use crate::source_uri::{build_chunk_anchor, parse_zarr_uri};
 
 /// Open a Zarr group and eagerly fetch every chunk's bytes into the
 /// returned `StructArray`. Each row holds one chunk position's data
 /// across every array in the group.
-pub fn group_to_indb_rasters(group_uri: &str) -> Result<StructArray, ArrowError> {
-    build_rasters(group_uri, Mode::InDb)
+///
+/// `creds` carries optional per-backend credentials; passing
+/// [`ZarrCredentialOptions::default()`] falls back to standard env-var
+/// authentication (matches CLI / SDK behaviour for AWS, GCP, Azure).
+pub fn group_to_indb_rasters(
+    group_uri: &str,
+    creds: &ZarrCredentialOptions,
+) -> Result<StructArray, ArrowError> {
+    build_rasters(group_uri, Mode::InDb, creds)
 }
 
 /// Open a Zarr group and emit one row per chunk position with chunk-anchor
 /// URIs in each band's `outdb_uri`. The `data` column is empty; bytes
 /// resolve on demand through whichever OutDb loader is registered for
 /// the `zarr` format.
-pub fn group_to_outdb_rasters(group_uri: &str) -> Result<StructArray, ArrowError> {
-    build_rasters(group_uri, Mode::OutDb)
+pub fn group_to_outdb_rasters(
+    group_uri: &str,
+    creds: &ZarrCredentialOptions,
+) -> Result<StructArray, ArrowError> {
+    build_rasters(group_uri, Mode::OutDb, creds)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,7 +83,7 @@ struct ArrayInfo {
     /// surface in band names.
     path: String,
     /// Open zarrs handle.
-    array: Array<FilesystemStore>,
+    array: Array<dyn ReadableListableStorageTraits>,
     /// SedonaDB BandDataType corresponding to this array's zarrs dtype.
     data_type: BandDataType,
     /// Dimension names in array order. Required to be `Some(_)` for every
@@ -92,17 +101,14 @@ struct ArrayInfo {
     nodata: Option<Vec<u8>>,
 }
 
-fn build_rasters(group_uri: &str, mode: Mode) -> Result<StructArray, ArrowError> {
-    let fs_path = group_uri_to_filesystem_path(group_uri)?;
-    let store = FilesystemStore::new(&fs_path).map_err(|e| {
-        ArrowError::ExternalError(Box::new(sedona_internal_datafusion_err!(
-            "failed to open Zarr filesystem store at {}: {e}",
-            fs_path.display()
-        )))
-    })?;
-    let storage: Arc<FilesystemStore> = Arc::new(store);
+fn build_rasters(
+    group_uri: &str,
+    mode: Mode,
+    creds: &ZarrCredentialOptions,
+) -> Result<StructArray, ArrowError> {
+    let (storage, group_path) = parse_zarr_uri(group_uri, creds)?;
 
-    let group = Group::open(storage.clone(), "/").map_err(|e| {
+    let group = Group::open(storage.clone(), &group_path).map_err(|e| {
         ArrowError::ExternalError(Box::new(sedona_internal_datafusion_err!(
             "failed to open Zarr group at {group_uri}: {e}"
         )))
@@ -217,7 +223,7 @@ fn build_rasters(group_uri: &str, mode: Mode) -> Result<StructArray, ArrowError>
 /// filesystem stores currently happen to enumerate alphabetically, but
 /// that's not part of the contract we want consumers to rely on).
 fn collect_array_infos(
-    mut arrays: Vec<Array<FilesystemStore>>,
+    mut arrays: Vec<Array<dyn ReadableListableStorageTraits>>,
 ) -> Result<Vec<ArrayInfo>, ArrowError> {
     arrays.sort_by(|a, b| a.path().as_str().cmp(b.path().as_str()));
     let mut out = Vec::with_capacity(arrays.len());
@@ -394,7 +400,7 @@ fn advance_chunk_indices(chunk_indices: &mut [u64], chunk_grid_shape: &[u64]) ->
 /// element types — those don't have a `BandDataType` counterpart anyway,
 /// so the dtype check in `collect_array_infos` rejects them upstream.
 fn retrieve_chunk_bytes(
-    array: &Array<FilesystemStore>,
+    array: &Array<dyn ReadableListableStorageTraits>,
     chunk_indices: &[u64],
 ) -> Result<Vec<u8>, ArrowError> {
     let bytes = array

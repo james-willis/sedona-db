@@ -56,9 +56,10 @@ use datafusion::physical_plan::{
 };
 use datafusion::prelude::Expr;
 use datafusion_common::{plan_err, DataFusionError, ScalarValue};
-use sedona_raster_zarr::{group_to_indb_rasters, group_to_outdb_rasters};
+use sedona_raster_zarr::{group_to_indb_rasters, group_to_outdb_rasters, ZarrCredentialOptions};
 use sedona_schema::datatypes::SedonaType;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Table function `sd_read_zarr(uri[, options_json])`.
 ///
@@ -130,9 +131,10 @@ impl ZarrChunkProvider {
             );
         }
 
+        let creds = ZarrCredentialOptions::new(opts.credentials);
         let rasters = match mode {
-            "indb" => group_to_indb_rasters(uri).map_err(arrow_to_df_err)?,
-            "outdb" => group_to_outdb_rasters(uri).map_err(arrow_to_df_err)?,
+            "indb" => group_to_indb_rasters(uri, &creds).map_err(arrow_to_df_err)?,
+            "outdb" => group_to_outdb_rasters(uri, &creds).map_err(arrow_to_df_err)?,
             other => {
                 return plan_err!(
                     "sd_read_zarr() mode must be \"indb\" or \"outdb\"; got {other:?}"
@@ -315,6 +317,12 @@ struct ZarrReadOptions {
     mode: Option<String>,
     rows_per_batch: Option<usize>,
     num_partitions: Option<usize>,
+    /// Per-backend credential overrides, keyed by `<scheme>.<field>`
+    /// (e.g. `aws.region`, `gcp.service_account_path`). Flattened so
+    /// callers can include them at the top level of the options JSON
+    /// alongside `mode`, `rows_per_batch`, etc.
+    #[serde(flatten)]
+    credentials: HashMap<String, String>,
 }
 
 fn parse_options(options_json: Option<&str>) -> Result<ZarrReadOptions> {
@@ -475,6 +483,46 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("num_partitions = 1"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn udtf_threads_credential_options_into_loader() {
+        // The credential map is flattened into the same JSON object as
+        // `mode` and friends — verifies that adding cloud-scoped keys
+        // (aws.*/gcp.*/azure.*) doesn't break the unknown-mode check or
+        // shadow the structured fields. Filesystem paths ignore the
+        // credentials entirely, so the read still succeeds.
+        let tmp = build_fixture();
+        let uri = format!("file://{}", tmp.path().display());
+
+        let ctx = SessionContext::new();
+        ctx.register_udtf("sd_read_zarr", Arc::new(ZarrReadFunction::default()));
+
+        let df = ctx
+            .sql(&format!(
+                r#"SELECT raster FROM sd_read_zarr('{uri}', '{{"mode":"indb","aws.region":"us-west-2","aws.access_key_id":"AKIATEST"}}')"#,
+            ))
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2);
+    }
+
+    #[tokio::test]
+    async fn udtf_rejects_unknown_scheme() {
+        // Cloud schemes used to be rejected wholesale here; now only
+        // genuinely unsupported schemes (ftp, file2, etc.) error.
+        let ctx = SessionContext::new();
+        ctx.register_udtf("sd_read_zarr", Arc::new(ZarrReadFunction::default()));
+
+        let err = ctx
+            .sql(r#"SELECT raster FROM sd_read_zarr('ftp://example.com/foo.zarr')"#)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ftp"), "got: {err}");
+        assert!(err.contains("unsupported"), "got: {err}");
     }
 
     #[tokio::test]
