@@ -75,13 +75,10 @@ jobs:
           VCPKG_ROOT: ${{ github.workspace }}/vcpkg
           VCPKG_DEFAULT_TRIPLET: x64-windows-dynamic-release
           CMAKE_TOOLCHAIN_FILE: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
-          CIBW_BUILD: "*-win_amd64"
+          CIBW_BUILD: "cp313-win_amd64"
           CIBW_TEST_REQUIRES: pytest adbc_driver_manager geoarrow-pyarrow geopandas
-          # Test command exits 0 even on failure so CIBW continues building all wheels;
-          # failures are recorded in .test_failed and checked after upload.
-          # We use Python here to be absolutely sure there are no shell escaping issues.
-          CIBW_TEST_COMMAND: >-
-            python -c "import subprocess,sys,pathlib; proj=pathlib.Path(r'{project}'); r=subprocess.run([sys.executable,'-m','pytest',str(pathlib.Path(r'{package}')/'tests'),'-vv','-o','faulthandler_timeout=600']); r.returncode and (print(f'Tests failed (exit {r.returncode}), creating .test_failed marker at {proj.absolute()}') or (proj/'.test_failed').touch() or True); sys.exit(0)"
+          # DIAGNOSTIC: run the shutdown-crash probe instead of pytest.
+          CIBW_TEST_COMMAND: "python {project}/ci/scripts/win_teardown_probe.py"
 
       - uses: actions/upload-artifact@v7
         with:
