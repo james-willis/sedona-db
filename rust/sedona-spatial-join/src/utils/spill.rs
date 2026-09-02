@@ -31,6 +31,7 @@ use datafusion_physical_plan::metrics::SpillMetrics;
 use crate::utils::arrow_utils::{
     compact_batch, get_record_batch_memory_size, schema_contains_view_types,
 };
+use crate::utils::spill_writeback::SpillWritebackAdvisor;
 
 /// Generic Arrow IPC stream spill writer for [`RecordBatch`].
 ///
@@ -41,6 +42,7 @@ pub(crate) struct RecordBatchSpillWriter {
     metrics: SpillMetrics,
     batch_in_memory_size_threshold: Option<usize>,
     gc_view_arrays: bool,
+    writeback: SpillWritebackAdvisor,
 }
 
 impl RecordBatchSpillWriter {
@@ -69,6 +71,7 @@ impl RecordBatchSpillWriter {
             metrics,
             batch_in_memory_size_threshold,
             gc_view_arrays,
+            writeback: SpillWritebackAdvisor::new(),
         })
     }
 
@@ -135,6 +138,14 @@ impl RecordBatchSpillWriter {
         })?;
 
         self.metrics.spilled_rows.add(batch.num_rows());
+
+        // Keep the page-cache footprint of the spill file bounded: queue
+        // asynchronous writeback and drop already-written pages as we go.
+        // (No-op on non-Linux platforms.)
+        let file = self.writer.get_ref();
+        if let Ok(len) = file.metadata().map(|m| m.len()) {
+            self.writeback.advise_written(file, len);
+        }
         Ok(())
     }
 
@@ -145,6 +156,13 @@ impl RecordBatchSpillWriter {
         in_progress_file.update_disk_usage()?;
         let size = in_progress_file.current_disk_usage();
         self.metrics.spilled_bytes.add(size as usize);
+
+        // Flush the tail and advise the whole file out of the page cache;
+        // it will be read back (at most once) from disk.
+        let mut writeback = self.writeback;
+        if let Ok(file) = self.writer.into_inner() {
+            writeback.advise_finished(&file, size);
+        }
         Ok(in_progress_file)
     }
 }
