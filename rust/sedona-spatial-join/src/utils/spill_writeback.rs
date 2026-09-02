@@ -43,6 +43,12 @@
 //!
 //! On non-Linux platforms this module is a no-op.
 //!
+//! The read side needs hygiene too: spilled data read back re-populates the
+//! page cache as clean pages, and a cgroup riding `memory.current ==
+//! memory.max` on retained clean cache can lose a reclaim race and be
+//! OOM-killed. [`SpillReadAdvisor`] drops pages behind the read frontier and
+//! drops the whole file when reading finishes.
+//!
 //! The chunk size can be tuned with the `SEDONA_SPILL_WRITEBACK_CHUNK_BYTES`
 //! environment variable; `0` disables the hygiene entirely.
 
@@ -184,6 +190,103 @@ impl SpillWritebackAdvisor {
     pub fn advise_finished(&mut self, _file: &File, _written: u64) {}
 }
 
+/// Read-side page-cache hygiene for spill files.
+///
+/// Bounding the dirty side is not enough inside a memory-limited cgroup:
+/// spilled data read back during the probe/merge phase re-populates the page
+/// cache as CLEAN pages, and a container that rides `memory.current ==
+/// memory.max` on retained clean cache can still lose a reclaim race and get
+/// OOM-killed (observed at teardown: 9.46 GB of inactive_file with process
+/// RSS flat at 2.39 GiB). Spill files are read exactly once, sequentially,
+/// so the pages behind the read frontier have no future value: drop them as
+/// the reader advances, and drop the whole file when the reader is done.
+#[derive(Debug, Default)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) struct SpillReadAdvisor {
+    /// Bytes up to this offset have been advised out of the page cache.
+    dropped: u64,
+    /// Whether the whole file has already been advised away.
+    finished: bool,
+}
+
+impl SpillReadAdvisor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Called once after opening a spill file for reading: declare sequential
+    /// access so kernel readahead stays effective without over-caching.
+    #[cfg(target_os = "linux")]
+    pub fn advise_opened(file: &File) {
+        use std::os::fd::AsRawFd;
+        if chunk_bytes() == 0 {
+            return;
+        }
+        // SAFETY: plain syscall on a valid, open fd; failures are ignored.
+        unsafe {
+            libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn advise_opened(_file: &File) {}
+
+    /// Called after consuming data from the file: drop whole chunks of page
+    /// cache behind the underlying descriptor's read position. Everything
+    /// before that position has either been consumed or sits in the reader's
+    /// userspace buffer, so the cached pages have no future value.
+    #[cfg(target_os = "linux")]
+    pub fn advise_progress(&mut self, file: &File) {
+        use std::os::fd::AsRawFd;
+        let chunk = chunk_bytes();
+        if chunk == 0 || self.finished {
+            return;
+        }
+        let fd = file.as_raw_fd();
+        // SAFETY: see advise_opened.
+        let pos = unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) };
+        if pos <= 0 {
+            return;
+        }
+        let droppable = (pos as u64 / chunk) * chunk;
+        if droppable > self.dropped {
+            // SAFETY: see advise_opened.
+            unsafe {
+                libc::posix_fadvise(
+                    fd,
+                    self.dropped as libc::off64_t,
+                    (droppable - self.dropped) as libc::off64_t,
+                    libc::POSIX_FADV_DONTNEED,
+                );
+            }
+            self.dropped = droppable;
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn advise_progress(&mut self, _file: &File) {}
+
+    /// Called when reading ends (stream exhausted or reader dropped): drop
+    /// the whole file from the page cache, including any dirty tail retained
+    /// from the write side that has become clean since.
+    #[cfg(target_os = "linux")]
+    pub fn advise_closed(&mut self, file: &File) {
+        use std::os::fd::AsRawFd;
+        if chunk_bytes() == 0 || self.finished {
+            return;
+        }
+        // Length 0 means "to the end of the file".
+        // SAFETY: see advise_opened.
+        unsafe {
+            libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+        }
+        self.finished = true;
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn advise_closed(&mut self, _file: &File) {}
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
@@ -217,5 +320,37 @@ mod tests {
         advisor.advise_finished(&file, written);
         assert_eq!(advisor.synced, written);
         assert_eq!(advisor.dropped, written);
+    }
+
+    /// Smoke test for the read side: syscalls are harmless and the drop
+    /// frontier follows the descriptor's read position in whole chunks.
+    #[test]
+    fn advises_read_file_in_chunks() {
+        use std::io::Read;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spill_read");
+        let chunk = chunk_bytes();
+        if chunk == 0 {
+            return;
+        }
+        std::fs::write(&path, vec![7u8; (2 * chunk + chunk / 2) as usize]).unwrap();
+
+        let mut file = File::open(&path).unwrap();
+        SpillReadAdvisor::advise_opened(&file);
+        let mut advisor = SpillReadAdvisor::new();
+        let mut buf = vec![0u8; 1024 * 1024];
+        let mut consumed = 0u64;
+        loop {
+            let n = file.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            consumed += n as u64;
+            advisor.advise_progress(&file);
+            assert_eq!(advisor.dropped, (consumed / chunk) * chunk);
+        }
+        advisor.advise_closed(&file);
+        assert!(advisor.finished);
     }
 }

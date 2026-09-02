@@ -31,7 +31,7 @@ use datafusion_physical_plan::metrics::SpillMetrics;
 use crate::utils::arrow_utils::{
     compact_batch, get_record_batch_memory_size, schema_contains_view_types,
 };
-use crate::utils::spill_writeback::SpillWritebackAdvisor;
+use crate::utils::spill_writeback::{SpillReadAdvisor, SpillWritebackAdvisor};
 
 /// Generic Arrow IPC stream spill writer for [`RecordBatch`].
 ///
@@ -170,11 +170,16 @@ impl RecordBatchSpillWriter {
 /// Generic Arrow IPC stream spill reader for [`RecordBatch`].
 pub(crate) struct RecordBatchSpillReader {
     stream_reader: StreamReader<BufReader<File>>,
+    read_advisor: SpillReadAdvisor,
 }
 
 impl RecordBatchSpillReader {
     pub fn try_new(temp_file: &RefCountedTempFile) -> Result<Self> {
         let file = File::open(temp_file.path())?;
+        // Spill files are read exactly once, sequentially: declare that to
+        // the kernel, and drop consumed pages behind the read frontier as we
+        // go (see `spill_writeback`). No-op on non-Linux platforms.
+        SpillReadAdvisor::advise_opened(&file);
         let mut stream_reader = StreamReader::try_new_buffered(file, None)?;
 
         // SAFETY: spill writers in this crate strictly follow Arrow IPC specifications.
@@ -183,7 +188,10 @@ impl RecordBatchSpillReader {
             stream_reader = stream_reader.with_skip_validation(true);
         }
 
-        Ok(Self { stream_reader })
+        Ok(Self {
+            stream_reader,
+            read_advisor: SpillReadAdvisor::new(),
+        })
     }
 
     pub fn schema(&self) -> SchemaRef {
@@ -191,9 +199,28 @@ impl RecordBatchSpillReader {
     }
 
     pub fn next_batch(&mut self) -> Option<Result<RecordBatch>> {
-        self.stream_reader
-            .next()
-            .map(|result| result.map_err(|e| e.into()))
+        let item = self.stream_reader.next();
+        match &item {
+            Some(_) => {
+                let file = self.stream_reader.get_ref().get_ref();
+                self.read_advisor.advise_progress(file);
+            }
+            None => {
+                // Stream exhausted: nothing in this file is needed any more.
+                let file = self.stream_reader.get_ref().get_ref();
+                self.read_advisor.advise_closed(file);
+            }
+        }
+        item.map(|result| result.map_err(|e| e.into()))
+    }
+}
+
+impl Drop for RecordBatchSpillReader {
+    fn drop(&mut self) {
+        // Covers readers that stop early (e.g. LIMIT pushed into a probe):
+        // the file's cached pages have no future value either way.
+        let file = self.stream_reader.get_ref().get_ref();
+        self.read_advisor.advise_closed(file);
     }
 }
 
