@@ -80,6 +80,7 @@ wkt = { workspace = true }
 tokio = { workspace = true, features = ["macros"] }
 rand = { workspace = true }
 env_logger = { workspace = true }
+tempfile = { workspace = true }
 
 [[bench]]
 name = "kdb"
@@ -115,3 +116,6 @@ harness = false
 name = "flat_vs_rtree"
 path = "bench/partitioning/flat_vs_rtree.rs"
 harness = false
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
