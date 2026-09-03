@@ -97,11 +97,6 @@ impl SedonaAccumulator for STCollectAggr {
 #[derive(Debug)]
 struct CollectionAccumulator {
     input_type: SedonaType,
-    /// The geometry type/dimension combinations seen by this group, as an
-    /// inline u32 bitset: the per-group hash sets this replaces allocated
-    /// ~100 bytes of heap on first insert in every non-empty group, cost two
-    /// mallocs per row on the update path, and were invisible to
-    /// `Accumulator::size()`.
     type_and_dims: GeometryTypeAndDimensionsSet,
     count: i64,
     item: Option<Vec<u8>>,
