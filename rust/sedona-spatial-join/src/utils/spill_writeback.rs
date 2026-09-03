@@ -151,12 +151,16 @@ impl SpillWritebackAdvisor {
     #[cfg(not(target_os = "linux"))]
     pub fn advise_written(&mut self, _file: &File, _written: u64) {}
 
-    /// Called once after the file is fully written: queue writeback for the
-    /// tail and advise the whole file out of the cache without blocking.
-    /// Pages whose writeback has not finished stay resident until it does,
-    /// bounded by roughly a lag window per file. Files smaller than one
-    /// chunk are left alone: they may be read back moments later and are too
-    /// small to endanger the container.
+    /// Called once after the file is fully written: wait for the tail's
+    /// writeback and drop the whole file from the cache. The wait is bounded
+    /// by one lag window of writeback (the same budget the steady-state
+    /// backpressure already imposes); without it, DONTNEED skips the
+    /// still-dirty tail and every finished-but-unread spill file retains up
+    /// to a lag window of since-cleaned pages that nothing ever revisits -
+    /// multiplied across the many files of a multi-round repartition, that
+    /// retention reaches gigabytes on a memory-limited container. Files
+    /// smaller than one chunk are left alone: they may be read back moments
+    /// later and are too small to endanger the container.
     #[cfg(target_os = "linux")]
     pub fn advise_finished(&mut self, file: &File, written: u64) {
         use std::os::fd::AsRawFd;
@@ -165,20 +169,25 @@ impl SpillWritebackAdvisor {
             return;
         }
         let fd = file.as_raw_fd();
-        if written > self.synced {
+        if written > self.dropped {
+            // Wait for everything not yet dropped to reach disk, then drop
+            // it. The span is at most a lag window plus the final partial
+            // chunk; anything older was already waited on and dropped.
             // SAFETY: see advise_written.
             unsafe {
                 libc::sync_file_range(
                     fd,
-                    self.synced as libc::off64_t,
-                    (written - self.synced) as libc::off64_t,
-                    libc::SYNC_FILE_RANGE_WRITE,
+                    self.dropped as libc::off64_t,
+                    (written - self.dropped) as libc::off64_t,
+                    libc::SYNC_FILE_RANGE_WAIT_BEFORE
+                        | libc::SYNC_FILE_RANGE_WRITE
+                        | libc::SYNC_FILE_RANGE_WAIT_AFTER,
                 );
             }
             self.synced = written;
         }
-        // Length 0 means "to the end of the file". Dirty pages are skipped by
-        // DONTNEED but become reclaimable once the queued writeback completes.
+        // Length 0 means "to the end of the file"; everything is clean now,
+        // so this drops the file's entire cache footprint.
         // SAFETY: see advise_written.
         unsafe {
             libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED);
