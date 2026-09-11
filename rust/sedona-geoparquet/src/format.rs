@@ -470,6 +470,19 @@ impl GeoParquetFileSource {
         self
     }
 
+    /// Set the file-metadata cache used by the inner Parquet opener's footer reads.
+    ///
+    /// Typically obtained from `RuntimeEnv::cache_manager().get_file_metadata_cache()`.
+    /// [`GeoParquetFormat::create_physical_plan`] sets this internally; this setter lets
+    /// embedders that build the [`FileScanConfig`] directly from [`file_source`] apply the
+    /// same caching.
+    ///
+    /// [`file_source`]: datafusion_datasource::file_format::FileFormat::file_source
+    pub fn with_metadata_cache(mut self, cache: Arc<dyn FileMetadataCache>) -> Self {
+        self.metadata_cache = Some(cache);
+        self
+    }
+
     pub fn with_options(&self, options: TableGeoParquetOptions) -> Self {
         Self {
             options,
